@@ -249,6 +249,38 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Trusted document directories
+#
+# Only files under these directories can be sent outbound via DOCUMENT: tags.
+# This prevents the agent from exfiltrating arbitrary host files.
+# Extend via HERMES_TRUSTED_DOCUMENT_DIRS env var (colon-separated paths).
+# ---------------------------------------------------------------------------
+
+TRUSTED_DOCUMENT_DIRS = [
+    Path(os.path.realpath(os.path.expanduser("~/.hermes"))),
+    Path(os.path.realpath("/tmp")),
+    Path(os.path.realpath(os.path.expanduser("~/Documents"))),
+]
+
+# Allow extending via environment variable
+_extra_dirs = os.getenv("HERMES_TRUSTED_DOCUMENT_DIRS", "")
+if _extra_dirs:
+    for d in _extra_dirs.split(":"):
+        d = d.strip()
+        if d:
+            TRUSTED_DOCUMENT_DIRS.append(Path(os.path.expanduser(d)))
+
+
+def _is_trusted_document_path(file_path: str) -> bool:
+    """Check if a file path is under one of the trusted document directories."""
+    real = Path(os.path.realpath(file_path))
+    return any(
+        real == trusted or trusted in real.parents
+        for trusted in TRUSTED_DOCUMENT_DIRS
+    )
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -526,8 +558,11 @@ class BasePlatformAdapter(ABC):
         cleaned = content
 
         # Match DOCUMENT:<path> or DOCUMENT:<path>|<caption>
-        doc_pattern = r'DOCUMENT:(\S+?)(?:\|([^\n]+))?(?:\s|$)'
-        for match in re.finditer(doc_pattern, content):
+        # Path: greedy match of everything except pipe or newline, stripped
+        # Caption (optional): everything after pipe until end of line
+        # Uses re.MULTILINE so $ matches end of each line
+        doc_pattern = r'^[ \t]*DOCUMENT:([^\|\n]+?)(?:\|([^\n]+))?[ \t]*$'
+        for match in re.finditer(doc_pattern, content, re.MULTILINE):
             path = match.group(1).strip()
             caption = (match.group(2) or "").strip()
             if path:
@@ -535,7 +570,7 @@ class BasePlatformAdapter(ABC):
 
         # Remove DOCUMENT tags from content
         if documents:
-            cleaned = re.sub(doc_pattern, '', cleaned)
+            cleaned = re.sub(doc_pattern, '', cleaned, flags=re.MULTILINE)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
         return documents, cleaned
@@ -720,12 +755,18 @@ class BasePlatformAdapter(ABC):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        if not os.path.exists(doc_path):
+                        # Resolve symlinks and canonicalize
+                        real_path = os.path.realpath(doc_path)
+                        if not os.path.exists(real_path):
                             print(f"[{self.name}] Document not found: {doc_path}")
+                            continue
+                        # Security: only allow files under trusted directories
+                        if not _is_trusted_document_path(real_path):
+                            print(f"[{self.name}] Document path outside trusted dirs, skipping: {real_path}")
                             continue
                         doc_result = await self.send_document(
                             chat_id=event.source.chat_id,
-                            file_path=doc_path,
+                            file_path=real_path,
                             caption=doc_caption if doc_caption else None,
                         )
                         if not doc_result.success:

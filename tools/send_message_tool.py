@@ -68,16 +68,41 @@ def _handle_list():
 
 
 def _validate_file_path(file_path: str) -> str | None:
-    """Validate and sanitize a file path. Returns error string or None if OK."""
+    """Validate and sanitize a file path. Returns error string or None if OK.
+
+    Security checks:
+    - Rejects '..' components in raw input
+    - Resolves symlinks via os.path.realpath
+    - Verifies file exists and is a regular file
+    - Ensures resolved path is under a trusted base directory
+    """
     if not file_path:
         return None
     # Reject path traversal — check raw input before normalization resolves it away
     if ".." in file_path.split("/") or ".." in file_path.split(os.sep):
         return "Path traversal detected: '..' components are not allowed"
-    if not os.path.exists(file_path):
+    # Resolve symlinks to canonical path
+    real_path = os.path.realpath(file_path)
+    if not os.path.exists(real_path):
         return f"File not found: {file_path}"
-    if not os.path.isfile(file_path):
+    if not os.path.isfile(real_path):
         return f"Path is not a file: {file_path}"
+    # Verify the resolved path is under a trusted directory
+    from pathlib import Path
+    trusted_dirs = [
+        Path(os.path.realpath(os.path.expanduser("~/.hermes"))),
+        Path(os.path.realpath("/tmp")),
+        Path(os.path.realpath(os.path.expanduser("~/Documents"))),
+    ]
+    extra = os.getenv("HERMES_TRUSTED_DOCUMENT_DIRS", "")
+    if extra:
+        for d in extra.split(":"):
+            d = d.strip()
+            if d:
+                trusted_dirs.append(Path(os.path.expanduser(d)))
+    resolved = Path(real_path)
+    if not any(resolved == t or t in resolved.parents for t in trusted_dirs):
+        return f"File path outside trusted directories: {file_path}"
     return None
 
 
@@ -233,12 +258,15 @@ async def _send_discord(token, chat_id, message, file_path=None):
 
         if file_path:
             from pathlib import Path
+            # Read file into bytes to avoid leaking file descriptors via FormData
+            file_bytes = open(file_path, "rb").read()
+            filename = Path(file_path).name
             form = aiohttp.FormData()
             form.add_field("content", message or "")
             form.add_field(
                 "files[0]",
-                open(file_path, "rb"),
-                filename=Path(file_path).name,
+                file_bytes,
+                filename=filename,
             )
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, data=form) as resp:
@@ -249,7 +277,7 @@ async def _send_discord(token, chat_id, message, file_path=None):
                     return {
                         "success": True, "platform": "discord", "chat_id": chat_id,
                         "message_id": data.get("id"), "type": "document",
-                        "filename": Path(file_path).name,
+                        "filename": filename,
                     }
         else:
             headers["Content-Type"] = "application/json"
